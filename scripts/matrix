@@ -1,0 +1,65 @@
+#!/bin/zsh
+# matrix on|off|tile|status — Matrix mode for Ghostty + Claude Code
+#   on:     green shader in every Ghostty window, hide the menu bar, tile the windows
+#   off:    restore the original look and the menu bar
+#   tile:   just re-tile the windows
+#   status: print "on" or "off"
+DIR="${0:A:h}"
+CONF="$HOME/.config/ghostty/matrix-mode.conf"
+STATE="$HOME/.config/matrix-mode/.menubar-before"
+
+reload_ghostty() {
+  # Ghostty has no CLI/signal reload on macOS, so press its "Reload Config" shortcut (⌘⇧,)
+  osascript <<'EOF' >/dev/null 2>&1
+tell application "System Events"
+  set previous to name of first application process whose frontmost is true
+  if not (exists process "Ghostty") then return
+end tell
+tell application "Ghostty" to activate
+delay 0.25
+tell application "System Events" to keystroke "," using {command down, shift down}
+delay 0.25
+if previous is not "Ghostty" then tell application previous to activate
+EOF
+}
+
+all_windows() {   # send a state straight to the terminal of every Ghostty window (also when tmux runs inside)
+  local g=$(pgrep -x ghostty | head -1)
+  [[ -n "$g" ]] || return
+  for t in $(ps -A -o tty=,ppid= | awk -v g="$g" '$2 == g && $1 != "??" {print $1}' | sort -u); do
+    "$DIR/matrix-state" "$1" "/dev/$t" raw
+  done
+}
+
+tile() { "$DIR/matrix-tile"; }
+
+case "${1:-on}" in
+  on)
+    mkdir -p "${STATE:h}"
+    cp "$DIR/ghostty-matrix.conf" "$CONF"
+    sed -i '' "s|^custom-shader = .*|custom-shader = $DIR/matrix.glsl|" "$CONF"
+    reload_ghostty
+    all_windows idle   # windows keep their previous background otherwise and the shader would paint them green
+    if [[ ! -f "$STATE" ]]; then
+      osascript -e 'tell application "System Events" to tell dock preferences to get autohide menu bar' > "$STATE" 2>/dev/null
+    fi
+    osascript -e 'tell application "System Events" to tell dock preferences to set autohide menu bar to true' 2>/dev/null
+    sleep 1
+    tile
+    ;;
+  off)
+    : > "$CONF"
+    reload_ghostty
+    sleep 0.5
+    all_windows reset   # only after the normal theme is loaded again
+    before=$(cat "$STATE" 2>/dev/null); [[ "$before" == true ]] || before=false
+    osascript -e "tell application \"System Events\" to tell dock preferences to set autohide menu bar to $before" 2>/dev/null
+    rm -f "$STATE"
+    sleep 1
+    tile >/dev/null   # the menu bar is back, fit the windows into the remaining space
+    echo "Matrix mode off"
+    ;;
+  tile) tile ;;
+  status) [[ -s "$CONF" ]] && echo on || echo off ;;
+  *) echo "usage: matrix on|off|tile|status"; exit 1 ;;
+esac

@@ -1,0 +1,12 @@
+# ~/.config/matrix-mode/config
+# Terminal layout: auto, or a fixed grid like 2x2, 3x2, 4x2, 4x3 (empty slots stay black)
+grid=auto
+# Share of the screen width for the browser on ultrawide screens (0 = never move the browser)
+browser=0.34
+# Gap between windows in px
+gap=6
+# Toggle key: keycode + modifiers. Default ctrl+alt+cmd+M. Find a keycode with ~/.matrix-mode/matrix-keycode
+hotkey=46
+hotkey_mods=ctrl+alt+cmd
+# Run the matrix script through `ssh localhost` (only if your ssh session holds Accessibility permission)
+via_ssh=0

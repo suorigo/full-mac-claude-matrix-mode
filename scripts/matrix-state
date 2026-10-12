@@ -1,0 +1,105 @@
+#!/bin/zsh
+# matrix-state hook                          (Claude Code hook, reads the event JSON on stdin)
+# matrix-state working|idle|reset [/dev/ttysNNN [raw]]   (manual)
+#
+# Tells the shader whether Claude is working in this window (rain shows through) or waiting for you
+# (calm), by setting an almost invisible background tint with OSC 11.
+# "Working" also covers subagents and background tasks that are still running after Claude's turn
+# ended, so a window only turns calm when everything in it is done, or when Claude asks you something.
+[[ -s "$HOME/.config/ghostty/matrix-mode.conf" || "$1" == reset ]] || { [[ "$1" == hook ]] && cat >/dev/null; exit 0; }
+
+state="$1"; tty="$2"
+if [[ "$1" == hook ]]; then
+  input="$(cat)"
+  # top-level fields only: event, session, agent/task id, notification type, background tasks yes/no
+  IFS=$'\t' read -r event session aid tid ntype bg <<< "$(printf '%s' "$input" | /usr/bin/python3 -c '
+import json, sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+s = lambda k: d.get(k) if isinstance(d.get(k), str) and d.get(k) else "-"
+print("\t".join([s("hook_event_name"), s("session_id"), s("agent_id"), s("task_id"),
+                 s("notification_type"), "1" if d.get("background_tasks") else "0"]))' 2>/dev/null)"
+  session="${session//[^A-Za-z0-9_-]/}"; aid="${aid//[^A-Za-z0-9_-]/}"; tid="${tid//[^A-Za-z0-9_-]/}"
+  [[ -n "$session" && "$session" != - ]] || session=nosession
+  dir="$HOME/.cache/matrix-mode/$session"
+  mkdir -p "$dir/agents"
+  case "$event" in
+    SessionStart)                   rm -rf "$dir"; mkdir -p "$dir/agents" ;;
+    UserPromptSubmit|PreToolUse)
+      # tool calls of subagents arrive in the same session but carry agent_id: count them as the agent,
+      # not as Claude's own turn (otherwise the window stays "working" after the agent is gone)
+      if [[ "$aid" != - && -n "$aid" ]]; then : > "$dir/agents/$aid"
+      else rm -f "$dir/block"; : > "$dir/main"; fi ;;
+    SubagentStart)                  [[ -n "$aid" && "$aid" != - ]] && : > "$dir/agents/$aid" ;;
+    SubagentStop)                   [[ -n "$aid" && "$aid" != - ]] && rm -f "$dir/agents/$aid"; [[ -z "$(ls -A "$dir/agents")" ]] && rm -f "$dir/bg" ;;
+    TaskCreated)                    [[ -n "$tid" && "$tid" != - ]] && : > "$dir/agents/task-$tid" ;;
+    TaskCompleted)                  [[ -n "$tid" && "$tid" != - ]] && rm -f "$dir/agents/task-$tid"; [[ -z "$(ls -A "$dir/agents")" ]] && rm -f "$dir/bg" ;;
+    Notification)
+      case "$ntype" in
+        idle_prompt|auth_*) ;;                                     # not a question, keep the state
+        elicitation_complete|elicitation_response) rm -f "$dir/block" ;;
+        *) : > "$dir/block" ;;                                     # permission prompt, question → your turn
+      esac ;;
+    Stop)
+      rm -f "$dir/main" "$dir/block"
+      (( bg )) && : > "$dir/bg" || { rm -f "$dir/bg"; find "$dir/agents" -mindepth 1 -delete 2>/dev/null; } ;;
+  esac
+  # waiting for you beats everything; otherwise working while anything at all still runs
+  running=$(find "$dir/agents" -type f -mmin -60 2>/dev/null | wc -l)
+  bgflag=$(find "$dir" -maxdepth 1 -name bg -mmin -30 2>/dev/null | wc -l)   # background shells have no end hook, give up after 30 min
+  if [[ -f "$dir/block" ]]; then state=idle
+  elif [[ -f "$dir/main" ]] || (( running > 0 || bgflag > 0 )); then state=working
+  else state=idle; fi
+  find "$HOME/.cache/matrix-mode" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null
+fi
+
+case "$state" in
+  working) seq=$'\e]11;#040b04\a' ;;   # keep these two in sync with shaders/matrix.glsl
+  idle)    seq=$'\e]11;#000402\a' ;;
+  reset)   seq=$'\e]111\a' ;;
+  *) exit 0 ;;
+esac
+if [[ -z "$tty" ]]; then
+  if [[ -n "$TMUX_PANE" ]]; then
+    tty=$(tmux display -p -t "$TMUX_PANE" '#{pane_tty}' 2>/dev/null)
+  else
+    # hooks have no controlling tty, walk up to the Claude process that owns one
+    pid=$PPID
+    for _ in {1..10}; do
+      t=$(ps -o tty= -p $pid 2>/dev/null | tr -d ' ')
+      [[ "$t" == ttys* ]] && { tty="/dev/$t"; break; }
+      pid=$(ps -o ppid= -p $pid 2>/dev/null | tr -d ' ')
+      [[ -z "$pid" || "$pid" -le 1 ]] && break
+    done
+  fi
+fi
+[[ "$tty" == /dev/tty* && -w "$tty" ]] || exit 0
+# "raw": the tty belongs directly to a Ghostty window, write without tmux wrapping or checks
+if [[ "$3" == raw ]]; then printf '%s' "$seq" > "$tty" 2>/dev/null; exit 0; fi
+
+# Only Ghostty windows on this Mac, never Claude sessions reached over ssh from elsewhere
+in_ghostty() {   # does the parent chain of the process on terminal $1 lead to Ghostty?
+  local pid=$(ps -t "${1#/dev/}" -o pid= 2>/dev/null | head -1 | tr -d ' ')
+  while [[ -n "$pid" && "$pid" -gt 1 ]]; do
+    [[ "$(ps -o comm= -p $pid)" == *Ghostty.app* ]] && return 0
+    pid=$(ps -o ppid= -p $pid | tr -d ' ')
+  done
+  return 1
+}
+in_tmux=0
+if tmux list-panes -a -F '#{pane_tty}' 2>/dev/null | grep -qx "$tty"; then
+  in_tmux=1
+  ses=$(tmux list-panes -a -F '#{pane_tty} #{session_name}' | awk -v t="$tty" '$1==t {print $2; exit}')
+  ok=1
+  for c in $(tmux list-clients -t "$ses" -F '#{client_tty}' 2>/dev/null); do in_ghostty "$c" && ok=0; done
+  (( ok == 0 )) || exit 0
+else
+  in_ghostty "$tty" || exit 0
+fi
+if (( in_tmux )); then
+  # inside tmux the sequence has to be wrapped or tmux swallows it (needs allow-passthrough on)
+  printf '\ePtmux;%s\e\\' "${seq//$'\e'/$'\e\e'}" > "$tty" 2>/dev/null
+else
+  printf '%s' "$seq" > "$tty" 2>/dev/null
+fi
+exit 0
