@@ -45,8 +45,8 @@ print("\t".join([s("hook_event_name"), s("session_id"), s("agent_id"), s("task_i
       (( bg )) && : > "$dir/bg" || { rm -f "$dir/bg"; find "$dir/agents" -mindepth 1 -delete 2>/dev/null; } ;;
   esac
   # waiting for you beats everything; otherwise working while anything at all still runs
-  running=$(find "$dir/agents" -type f -mmin -60 2>/dev/null | wc -l)
-  bgflag=$(find "$dir" -maxdepth 1 -name bg -mmin -30 2>/dev/null | wc -l)   # background shells have no end hook, give up after 30 min
+  running=$(find "$dir/agents" -type f -mmin -360 2>/dev/null | wc -l)   # an agent can sit in one long command for a while
+  bgflag=$(find "$dir" -maxdepth 1 -name bg -mmin -360 2>/dev/null | wc -l)   # background shells have no end hook, give up after 6 h
   if [[ -f "$dir/block" ]]; then state=idle
   elif [[ -f "$dir/main" ]] || (( running > 0 || bgflag > 0 )); then state=working
   else state=idle; fi
