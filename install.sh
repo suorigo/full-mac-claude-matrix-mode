@@ -13,6 +13,7 @@ CFG_DIR="$HOME/.config/matrix-mode"
 GHOSTTY_DIR="$HOME/.config/ghostty"
 AGENT="dev.claude-matrix-mode.hotkey"
 PLIST="$HOME/Library/LaunchAgents/$AGENT.plist"
+SWEEP="dev.claude-matrix-mode.sweep"
 MARK="# claude-matrix-mode"
 
 via_ssh=0; hotkey=1; tmux_pt=0
@@ -110,6 +111,23 @@ with os.fdopen(fd, 'w') as f:
 os.chmod(tmp, mode)
 os.replace(tmp, p)
 EOF
+
+say "sweeper (LaunchAgent $SWEEP, calms windows after Esc or when Claude quits)"
+mkdir -p "$HOME/Library/LaunchAgents"
+cat > "$HOME/Library/LaunchAgents/$SWEEP.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>$SWEEP</string>
+<key>ProgramArguments</key><array><string>/bin/zsh</string><string>$PREFIX/matrix-state</string><string>sweep</string></array>
+<key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+<key>StartInterval</key><integer>10</integer>
+<key>RunAtLoad</key><true/>
+<key>StandardErrorPath</key><string>$HOME/Library/Logs/matrix-sweep.log</string>
+</dict></plist>
+EOF
+launchctl bootout "gui/$(id -u)/$SWEEP" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$SWEEP.plist"
 
 if (( tmux_pt )) && command -v tmux >/dev/null; then
   say "tmux passthrough (so the hook signal reaches Ghostty from inside tmux)"

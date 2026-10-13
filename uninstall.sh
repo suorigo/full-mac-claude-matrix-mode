@@ -8,8 +8,10 @@ osascript -e 'tell application id "dev.claude-matrix-mode.app" to quit' >/dev/nu
 sleep 2
 [[ -x "$PREFIX/matrix" && "$("$PREFIX/matrix" status)" == on ]] && "$PREFIX/matrix" off
 
-launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null
-rm -f "$HOME/Library/LaunchAgents/$AGENT.plist"
+for a in $AGENT dev.claude-matrix-mode.sweep; do
+  launchctl bootout "gui/$(id -u)/$a" 2>/dev/null
+  rm -f "$HOME/Library/LaunchAgents/$a.plist"
+done
 [[ "$(defaults read "$HOME/Applications/Matrix.app/Contents/Info" CFBundleIdentifier 2>/dev/null)" == dev.claude-matrix-mode.app ]] \
   && rm -rf "$HOME/Applications/Matrix.app"
 rm -rf "$PREFIX" "$HOME/.cache/matrix-mode"

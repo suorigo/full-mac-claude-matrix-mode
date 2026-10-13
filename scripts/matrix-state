@@ -1,39 +1,94 @@
 #!/bin/zsh
 # matrix-state hook                          (Claude Code hook, reads the event JSON on stdin)
 # matrix-state working|idle|reset [/dev/ttysNNN [raw]]   (manual)
+# matrix-state sweep                         (every few seconds from a LaunchAgent, see below)
 #
 # Tells the shader whether Claude is working in this window (rain shows through) or waiting for you
 # (calm), by setting an almost invisible background tint with OSC 11.
-# "Working" also covers subagents and background tasks that are still running after Claude's turn
-# ended, so a window only turns calm when everything in it is done, or when Claude asks you something.
+# "Working" also covers subagents that are still running after Claude's turn ended, so a window only
+# turns calm when everything in it is done, or when Claude asks you something. Background shells
+# (dev servers, wait loops) count only for their first SHELL_MIN minutes, a server would never end.
+# Some endings have no hook at all (Esc, Claude quit or crashed, a background task finishing), so
+# `sweep` re-checks every window that is still marked working and calms it down.
+SHELL_MIN=15
 [[ -s "$HOME/.config/ghostty/matrix-mode.conf" || "$1" == reset ]] || { [[ "$1" == hook ]] && cat >/dev/null; exit 0; }
+CACHE="$HOME/.cache/matrix-mode"
+
+# working or idle for one session folder, from the marker files the hook keeps there
+compute() {   # $1 = session dir
+  local d="$1" running shells
+  [[ -f "$d/block" ]] && { echo idle; return; }
+  [[ -f "$d/main" ]] && { echo working; return; }
+  running=$(find "$d/agents" -type f -mmin -360 2>/dev/null | wc -l)          # an agent can sit in one long command for a while
+  shells=$(find "$d/shells" -type f -mmin -$SHELL_MIN 2>/dev/null | wc -l)
+  (( running > 0 || shells > 0 )) && echo working || echo idle
+}
+
+if [[ "$1" == sweep ]]; then
+  for d in "$CACHE"/*(N/); do
+    [[ -s "$d/tty" && -f "$d/state" ]] || continue
+    tty=$(<"$d/tty"); [[ -w "$tty" ]] || { rm -f "$d/tty"; continue; }
+    # Claude gone from that terminal (quit, crashed, window reused) → nothing works there any more
+    if ! ps -t "${tty#/dev/}" -o comm= 2>/dev/null | grep -qi claude; then
+      rm -rf "$d/main" "$d/block" "$d/agents" "$d/shells"
+    elif [[ -f "$d/main" && -s "$d/transcript" ]]; then
+      # Esc fires no hook: the transcript then ends with "[Request interrupted by user…]"
+      /usr/bin/python3 - "$(<"$d/transcript")" <<'EOF' && rm -f "$d/main"
+import json, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        f.seek(0, 2); f.seek(max(0, f.tell() - 400000)); lines = f.read().decode('utf-8', 'ignore').splitlines()
+except Exception: sys.exit(1)
+for l in reversed(lines):
+    try: e = json.loads(l)
+    except Exception: continue
+    if e.get('type') not in ('user', 'assistant') or e.get('isSidechain'): continue
+    c = (e.get('message') or {}).get('content')
+    t = c if isinstance(c, str) else ' '.join(x.get('text', '') for x in c or [] if isinstance(x, dict))
+    sys.exit(0 if e['type'] == 'user' and t.startswith('[Request interrupted by user') else 1)
+sys.exit(1)
+EOF
+    fi
+    mkdir -p "$d/agents"
+    new=$(compute "$d")
+    [[ "$new" == "$(<"$d/state")" ]] && continue
+    echo "$new" > "$d/state"
+    "$0" "$new" "$tty"
+  done
+  exit 0
+fi
 
 state="$1"; tty="$2"
 if [[ "$1" == hook ]]; then
   input="$(cat)"
   # top-level fields only: event, session, agent/task id, notification type, background tasks yes/no
-  IFS=$'\t' read -r event session aid tid ntype bg <<< "$(printf '%s' "$input" | /usr/bin/python3 -c '
+  # top-level fields, plus the ids of background tasks still running: shells apart from agents/workflows
+  IFS=$'\t' read -r event session aid tid ntype transcript bgshells bgagents <<< "$(printf '%s' "$input" | /usr/bin/python3 -c '
 import json, sys
 try: d = json.load(sys.stdin)
 except Exception: d = {}
 s = lambda k: d.get(k) if isinstance(d.get(k), str) and d.get(k) else "-"
+bt = [t for t in d.get("background_tasks") or [] if isinstance(t, dict) and t.get("status", "running") == "running"]
+ids = lambda shell: ",".join(str(t.get("id")) for t in bt if (t.get("type") in ("shell", "monitor")) == shell) or "-"
 print("\t".join([s("hook_event_name"), s("session_id"), s("agent_id"), s("task_id"),
-                 s("notification_type"), "1" if d.get("background_tasks") else "0"]))' 2>/dev/null)"
+                 s("notification_type"), s("transcript_path").replace("\t", " "), ids(True), ids(False)]))' 2>/dev/null)"
   session="${session//[^A-Za-z0-9_-]/}"; aid="${aid//[^A-Za-z0-9_-]/}"; tid="${tid//[^A-Za-z0-9_-]/}"
+  bgshells="${bgshells//[^A-Za-z0-9_,-]/}"; bgagents="${bgagents//[^A-Za-z0-9_,-]/}"
   [[ -n "$session" && "$session" != - ]] || session=nosession
-  dir="$HOME/.cache/matrix-mode/$session"
-  mkdir -p "$dir/agents"
+  dir="$CACHE/$session"
+  mkdir -p "$dir/agents" "$dir/shells"
+  [[ "$transcript" == /* ]] && print -r -- "$transcript" > "$dir/transcript"
   case "$event" in
-    SessionStart)                   rm -rf "$dir"; mkdir -p "$dir/agents" ;;
+    SessionStart)                   rm -rf "$dir/main" "$dir/block" "$dir/agents" "$dir/shells"; mkdir -p "$dir/agents" "$dir/shells" ;;
     UserPromptSubmit|PreToolUse)
       # tool calls of subagents arrive in the same session but carry agent_id: count them as the agent,
       # not as Claude's own turn (otherwise the window stays "working" after the agent is gone)
       if [[ "$aid" != - && -n "$aid" ]]; then : > "$dir/agents/$aid"
       else rm -f "$dir/block"; : > "$dir/main"; fi ;;
     SubagentStart)                  [[ -n "$aid" && "$aid" != - ]] && : > "$dir/agents/$aid" ;;
-    SubagentStop)                   [[ -n "$aid" && "$aid" != - ]] && rm -f "$dir/agents/$aid"; [[ -z "$(ls -A "$dir/agents")" ]] && rm -f "$dir/bg" ;;
+    SubagentStop)                   [[ -n "$aid" && "$aid" != - ]] && rm -f "$dir/agents/$aid" ;;
     TaskCreated)                    [[ -n "$tid" && "$tid" != - ]] && : > "$dir/agents/task-$tid" ;;
-    TaskCompleted)                  [[ -n "$tid" && "$tid" != - ]] && rm -f "$dir/agents/task-$tid"; [[ -z "$(ls -A "$dir/agents")" ]] && rm -f "$dir/bg" ;;
+    TaskCompleted)                  [[ -n "$tid" && "$tid" != - ]] && rm -f "$dir/agents/task-$tid" ;;
     Notification)
       case "$ntype" in
         idle_prompt|auth_*) ;;                                     # not a question, keep the state
@@ -41,16 +96,17 @@ print("\t".join([s("hook_event_name"), s("session_id"), s("agent_id"), s("task_i
         *) : > "$dir/block" ;;                                     # permission prompt, question → your turn
       esac ;;
     Stop)
-      rm -f "$dir/main" "$dir/block"
-      (( bg )) && : > "$dir/bg" || { rm -f "$dir/bg"; find "$dir/agents" -mindepth 1 -delete 2>/dev/null; } ;;
+      # the list of running background tasks is the truth: drop markers of anything no longer in it
+      rm -f "$dir/main" "$dir/block" "$dir/bg"
+      find "$dir/agents" -mindepth 1 -delete 2>/dev/null
+      for i in ${(s:,:)bgagents}; do [[ "$i" != - ]] && : > "$dir/agents/$i"; done
+      for f in "$dir"/shells/*(N); do [[ ",$bgshells," == *",${f:t},"* ]] || rm -f "$f"; done
+      for i in ${(s:,:)bgshells}; do [[ "$i" != - && ! -e "$dir/shells/$i" ]] && : > "$dir/shells/$i"; done ;;   # keep the start time
   esac
   # waiting for you beats everything; otherwise working while anything at all still runs
-  running=$(find "$dir/agents" -type f -mmin -360 2>/dev/null | wc -l)   # an agent can sit in one long command for a while
-  bgflag=$(find "$dir" -maxdepth 1 -name bg -mmin -360 2>/dev/null | wc -l)   # background shells have no end hook, give up after 6 h
-  if [[ -f "$dir/block" ]]; then state=idle
-  elif [[ -f "$dir/main" ]] || (( running > 0 || bgflag > 0 )); then state=working
-  else state=idle; fi
-  find "$HOME/.cache/matrix-mode" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null
+  state=$(compute "$dir")
+  echo "$state" > "$dir/state"
+  find "$CACHE" -mindepth 1 -maxdepth 1 -type d -mtime +2 -exec rm -rf {} + 2>/dev/null
 fi
 
 case "$state" in
@@ -74,6 +130,10 @@ if [[ -z "$tty" ]]; then
   fi
 fi
 [[ "$tty" == /dev/tty* && -w "$tty" ]] || exit 0
+if [[ "$1" == hook ]] && [[ "$(cat "$dir/tty" 2>/dev/null)" != "$tty" ]]; then
+  grep -lx "$tty" "$CACHE"/*/tty(N) 2>/dev/null | xargs rm -f   # one session per terminal: the latest one
+  print -r -- "$tty" > "$dir/tty"
+fi
 # "raw": the tty belongs directly to a Ghostty window, write without tmux wrapping or checks
 if [[ "$3" == raw ]]; then printf '%s' "$seq" > "$tty" 2>/dev/null; exit 0; fi
 
