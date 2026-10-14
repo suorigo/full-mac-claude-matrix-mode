@@ -31,12 +31,24 @@ if [[ "$1" == sweep ]]; then
     # Claude gone from that terminal (quit, crashed, window reused) → nothing works there any more
     if ! ps -t "${tty#/dev/}" -o comm= 2>/dev/null | grep -qi claude; then
       rm -rf "$d/main" "$d/block" "$d/agents" "$d/shells"
-    elif [[ -f "$d/main" && -s "$d/transcript" ]]; then
-      # Esc fires no hook: the transcript then ends with "[Request interrupted by user…]"
-      /usr/bin/python3 - "$(<"$d/transcript")" <<'EOF' && rm -f "$d/main"
-import json, sys
+    elif [[ -f "$d/main" ]]; then
+      # Esc, an API error or a cancelled prompt fire no hook. Claude Code itself keeps busy/idle in
+      # ~/.claude/sessions/<pid>.json, that is the truth; older versions: the transcript then ends
+      # with "[Request interrupted by user…]"
+      /usr/bin/python3 - "${d:t}" "$(<"$d/transcript" 2>/dev/null)" "$d/main" <<'EOF' && rm -f "$d/main"
+import glob, json, os, sys, time
+sid, tr, main = sys.argv[1], sys.argv[2], sys.argv[3]
+for p in glob.glob(os.path.expanduser('~/.claude/sessions/*.json')):
+    try:
+        s = json.load(open(p))
+        if s.get('sessionId') != sid: continue
+        os.kill(s['pid'], 0)
+    except Exception: continue
+    if s.get('status') in ('busy', 'idle'):
+        quiet = time.time() * 1000 - s.get('statusUpdatedAt', 0) > 5000   # not the moment a prompt was sent
+        sys.exit(0 if s['status'] == 'idle' and quiet and time.time() - os.path.getmtime(main) > 5 else 1)
 try:
-    with open(sys.argv[1], 'rb') as f:
+    with open(tr, 'rb') as f:
         f.seek(0, 2); f.seek(max(0, f.tell() - 400000)); lines = f.read().decode('utf-8', 'ignore').splitlines()
 except Exception: sys.exit(1)
 for l in reversed(lines):
