@@ -7,21 +7,19 @@
 # (calm), by setting an almost invisible background tint with OSC 11.
 # "Working" also covers subagents that are still running after Claude's turn ended, so a window only
 # turns calm when everything in it is done, or when Claude asks you something. Background shells
-# (dev servers, wait loops) count only for their first SHELL_MIN minutes, a server would never end.
+# (dev servers, wait loops) don't count: once Claude has answered, the window reads as done.
 # Some endings have no hook at all (Esc, Claude quit or crashed, a background task finishing), so
 # `sweep` re-checks every window that is still marked working and calms it down.
-SHELL_MIN=15
 [[ -s "$HOME/.config/ghostty/matrix-mode.conf" || "$1" == reset ]] || { [[ "$1" == hook ]] && cat >/dev/null; exit 0; }
 CACHE="$HOME/.cache/matrix-mode"
 
 # working or idle for one session folder, from the marker files the hook keeps there
 compute() {   # $1 = session dir
-  local d="$1" running shells
+  local d="$1" running
   [[ -f "$d/block" ]] && { echo idle; return; }
   [[ -f "$d/main" ]] && { echo working; return; }
   running=$(find "$d/agents" -type f -mmin -360 2>/dev/null | wc -l)          # an agent can sit in one long command for a while
-  shells=$(find "$d/shells" -type f -mmin -$SHELL_MIN 2>/dev/null | wc -l)
-  (( running > 0 || shells > 0 )) && echo working || echo idle
+  (( running > 0 )) && echo working || echo idle
 }
 
 if [[ "$1" == sweep ]]; then
